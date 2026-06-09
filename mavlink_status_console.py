@@ -4,7 +4,7 @@ Standalone MAVLink telemetry status console for debugging QGC-style message loss
 
 Edit the constants below, then run:
 
-    python3 tools/mavlink_status_console.py
+    python3 mavlink_status_console.py
 
 The loss counters intentionally mirror QGroundControl's Telemetry settings page:
 successfully decoded MAVLink messages are counted, and loss is inferred from
@@ -95,8 +95,10 @@ class SourceStats:
 @dataclass
 class MessageStats:
     count: int = 0
+    bytes_total: int = 0
     last_time: float = 0.0
     times: Deque[float] = field(default_factory=deque)
+    byte_times: Deque[Tuple[float, int]] = field(default_factory=deque)
 
 
 @dataclass
@@ -119,6 +121,8 @@ class QgcLossTracker:
         self.sources: Dict[SourceKey, SourceStats] = defaultdict(SourceStats)
         self.messages: Dict[MsgKey, MessageStats] = defaultdict(MessageStats)
         self.msg_times: Deque[float] = deque()
+        self.byte_times: Deque[Tuple[float, int]] = deque()
+        self.total_decoded_bytes = 0
         self.loss_times: Deque[Tuple[float, int]] = deque()
         self.recent_gaps: Deque[GapEvent] = deque(maxlen=RECENT_GAP_COUNT)
         self.heartbeats: Dict[SourceKey, float] = {}
@@ -126,7 +130,7 @@ class QgcLossTracker:
         self.first_msg_time: Optional[float] = None
         self.last_msg_time: Optional[float] = None
 
-    def update(self, message, now: float) -> Optional[GapEvent]:
+    def update(self, message, now: float, wire_len: int) -> Optional[GapEvent]:
         sysid = int(message.get_srcSystem())
         compid = int(message.get_srcComponent())
         seq = int(message.get_seq())
@@ -146,6 +150,8 @@ class QgcLossTracker:
         stats.last_msg_name = msg_name
         self.last_msg_time = now
         self.msg_times.append(now)
+        self.byte_times.append((now, wire_len))
+        self.total_decoded_bytes += wire_len
 
         expected_seq = seq if stats.last_seq is None else (stats.last_seq + 1) & 0xFF
         lost = seq - expected_seq if seq >= expected_seq else seq + 256 - expected_seq
@@ -180,8 +186,10 @@ class QgcLossTracker:
         msg_id = int(message.get_msgId())
         msg_stats = self.messages[(msg_id, msg_name)]
         msg_stats.count += 1
+        msg_stats.bytes_total += wire_len
         msg_stats.last_time = now
         msg_stats.times.append(now)
+        msg_stats.byte_times.append((now, wire_len))
 
         if msg_name == "HEARTBEAT":
             self.heartbeats[source] = now
@@ -208,11 +216,26 @@ class QgcLossTracker:
         self._trim_windows(now)
         return sum(lost for _, lost in self.loss_times) / RATE_WINDOW_S
 
-    def top_message_rates(self, now: float) -> Iterable[Tuple[float, int, str, int, float]]:
+    def recent_decoded_byte_rate(self, now: float) -> float:
+        self._trim_windows(now)
+        return sum(byte_count for _, byte_count in self.byte_times) / RATE_WINDOW_S
+
+    def top_message_bandwidth(self, now: float) -> Iterable[Tuple[float, float, int, str, int, int, float]]:
         self._trim_windows(now)
         rows = []
+        window_total_bytes = sum(byte_count for _, byte_count in self.byte_times)
         for (msg_id, name), stats in self.messages.items():
-            rows.append((len(stats.times) / RATE_WINDOW_S, msg_id, name, stats.count, now - stats.last_time))
+            window_bytes = sum(byte_count for _, byte_count in stats.byte_times)
+            pct = (window_bytes / window_total_bytes) * 100.0 if window_total_bytes else 0.0
+            rows.append((
+                window_bytes / RATE_WINDOW_S,
+                pct,
+                msg_id,
+                name,
+                stats.count,
+                stats.bytes_total,
+                now - stats.last_time,
+            ))
         return sorted(rows, reverse=True)[:TOP_MESSAGE_COUNT]
 
     def _trim_windows(self, now: float) -> None:
@@ -221,9 +244,13 @@ class QgcLossTracker:
             self.msg_times.popleft()
         while self.loss_times and self.loss_times[0][0] < cutoff:
             self.loss_times.popleft()
+        while self.byte_times and self.byte_times[0][0] < cutoff:
+            self.byte_times.popleft()
         for stats in self.messages.values():
             while stats.times and stats.times[0] < cutoff:
                 stats.times.popleft()
+            while stats.byte_times and stats.byte_times[0][0] < cutoff:
+                stats.byte_times.popleft()
 
 
 def connection_string() -> str:
@@ -262,8 +289,11 @@ def open_csv_log() -> Tuple[Optional[object], Optional[csv.DictWriter]]:
             "cumulative_loss_percent",
             "recent_msg_rate_hz",
             "recent_loss_rate_hz",
+            "transport_rx_Bps",
+            "decoded_rx_Bps",
             "parser_receive_errors",
             "bytes_received",
+            "decoded_bytes_received",
             "active_heartbeat_age_s",
         ],
     )
@@ -319,6 +349,22 @@ def fmt_age(age: Optional[float]) -> str:
     return f"{age:5.1f}s"
 
 
+def fmt_bandwidth(bytes_per_second: float) -> str:
+    bits_per_second = bytes_per_second * 8.0
+    if bits_per_second >= 1_000_000:
+        return f"{bits_per_second / 1_000_000:0.2f} Mbit/s"
+    if bits_per_second >= 1_000:
+        return f"{bits_per_second / 1_000:0.1f} kbit/s"
+    return f"{bits_per_second:0.0f} bit/s"
+
+
+def message_wire_len(message) -> int:
+    try:
+        return len(message.get_msgbuf())
+    except Exception:
+        return 0
+
+
 def write_gap_event(log_file, event: GapEvent) -> None:
     if not log_file:
         return
@@ -332,13 +378,14 @@ def write_gap_event(log_file, event: GapEvent) -> None:
     )
 
 
-def render(master, tracker: QgcLossTracker, start_time: float, last_bytes: Tuple[int, float]) -> Tuple[int, float]:
+def render(master, tracker: QgcLossTracker, start_time: float, last_bytes: Tuple[int, float]) -> Tuple[int, float, float, float]:
     now = time.monotonic()
     mav = master.mav
     bytes_received = int(getattr(mav, "total_bytes_received", 0))
     previous_bytes, previous_time = last_bytes
     dt = max(now - previous_time, 0.001)
     byte_rate = (bytes_received - previous_bytes) / dt
+    decoded_byte_rate = tracker.recent_decoded_byte_rate(now)
     parser_errors = int(getattr(mav, "total_receive_errors", 0))
     parser_packets = int(getattr(mav, "total_packets_received", 0))
 
@@ -363,7 +410,8 @@ def render(master, tracker: QgcLossTracker, start_time: float, last_bytes: Tuple
     print("Transport / Parser")
     print(f"  MAVLink parser packets:         {parser_packets}")
     print(f"  MAVLink parser receive errors:  {parser_errors}")
-    print(f"  Bytes received:                 {bytes_received} ({byte_rate:0.0f} B/s)")
+    print(f"  Transport bytes received:       {bytes_received} ({byte_rate:0.0f} B/s, {fmt_bandwidth(byte_rate)})")
+    print(f"  Decoded MAVLink bytes:          {tracker.total_decoded_bytes} ({decoded_byte_rate:0.0f} B/s, {fmt_bandwidth(decoded_byte_rate)})")
     print(f"  Recent window:                  {tracker.recent_msg_rate(now):0.1f} msg/s, {tracker.recent_loss_rate(now):0.1f} lost-msg/s over {RATE_WINDOW_S:0.0f}s")
     print()
 
@@ -393,10 +441,15 @@ def render(master, tracker: QgcLossTracker, start_time: float, last_bytes: Tuple
         )
 
     print()
-    print(f"Top Message Rates ({RATE_WINDOW_S:0.0f}s window)")
-    print("  rate     msgid name                         total age")
-    for rate, msg_id, name, count, age in tracker.top_message_rates(now):
-        print(f"{rate:6.1f}/s {msg_id:5d} {name[:28]:28s} {count:6d} {age:4.1f}s")
+    print(f"Top Message Bandwidth ({RATE_WINDOW_S:0.0f}s window)")
+    print("   B/s  share  msg/s msgid name                         total     bytes age")
+    for bytes_per_s, pct, msg_id, name, count, bytes_total, age in tracker.top_message_bandwidth(now):
+        msg_stats = tracker.messages[(msg_id, name)]
+        msg_rate = len(msg_stats.times) / RATE_WINDOW_S
+        print(
+            f"{bytes_per_s:6.0f} {pct:5.1f}% {msg_rate:5.1f} {msg_id:5d} "
+            f"{name[:28]:28s} {count:6d} {bytes_total:9d} {age:4.1f}s"
+        )
 
     print()
     print("Recent Sequence Gaps")
@@ -420,7 +473,7 @@ def render(master, tracker: QgcLossTracker, start_time: float, last_bytes: Tuple
     print("  Ctrl-C to stop. Edit constants at the top of this file to change links or debug behavior.")
     sys.stdout.flush()
 
-    return bytes_received, now
+    return bytes_received, now, byte_rate, decoded_byte_rate
 
 
 def main() -> int:
@@ -462,7 +515,7 @@ def main() -> int:
                 if message.get_type() == "BAD_DATA":
                     continue
 
-                gap_event = tracker.update(message, now)
+                gap_event = tracker.update(message, now, message_wire_len(message))
                 if gap_event is not None:
                     write_gap_event(event_log, gap_event)
 
@@ -474,7 +527,8 @@ def main() -> int:
                 continue
 
             if now - last_render >= DISPLAY_PERIOD_S:
-                last_bytes = render(master, tracker, start_time, last_bytes)
+                bytes_received, render_time, transport_byte_rate, decoded_byte_rate = render(master, tracker, start_time, last_bytes)
+                last_bytes = (bytes_received, render_time)
                 if csv_writer:
                     active = tracker.first_vehicle
                     active_hb_age = ""
@@ -490,8 +544,11 @@ def main() -> int:
                             "cumulative_loss_percent": f"{tracker.cumulative_loss_percent:0.3f}",
                             "recent_msg_rate_hz": f"{tracker.recent_msg_rate(now):0.3f}",
                             "recent_loss_rate_hz": f"{tracker.recent_loss_rate(now):0.3f}",
+                            "transport_rx_Bps": f"{transport_byte_rate:0.3f}",
+                            "decoded_rx_Bps": f"{decoded_byte_rate:0.3f}",
                             "parser_receive_errors": int(getattr(master.mav, "total_receive_errors", 0)),
                             "bytes_received": int(getattr(master.mav, "total_bytes_received", 0)),
+                            "decoded_bytes_received": tracker.total_decoded_bytes,
                             "active_heartbeat_age_s": active_hb_age,
                         }
                     )
